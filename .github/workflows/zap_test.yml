@@ -3,12 +3,16 @@ name: ZAP-Test
 on:
   push:
     branches: [ master ]
+permissions:
+  issues: write    # Required for ZAP to create/update issues
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout the Repo
+        uses: actions/checkout@v4
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
