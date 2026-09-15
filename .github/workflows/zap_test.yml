@@ -1,34 +1,214 @@
-- name: Checkout repository
-  uses: actions/checkout@v4
+name: ZAP-Test
 
-- name: Build and Run Docker Container
-  run: |
-    docker build -t vulnerable-app .
-    docker run -d --name vuln-app -p 5050:5050 vulnerable-app
-    sleep 30
+on:
+  push:
+    branches: [ master ]
 
-- name: Authenticate and Prepare ZAP Context
-  run: |
-    # Login to get auth token
-    AUTH_RESPONSE=$(curl -s -X POST http://localhost:5050/login \
-      -H "Content-Type: application/json" \
-      -d '{"username":"admin","password":"admin123"}')
-    
-    AUTH_TOKEN=$(echo $AUTH_RESPONSE | jq -r '.Authorization // .token // empty')
-    echo "AUTH_TOKEN=$AUTH_TOKEN" >> $GITHUB_ENV
-    
-    # Save auth for ZAP to use
-    echo $AUTH_TOKEN > /tmp/auth_token.txt
+permissions:
+  issues: write    # Required for ZAP to create/update issues
+  contents: read
 
-- name: ZAP Scan with Authentication
-  uses: zaproxy/action-full-scan@v0.13.0
-  env:
-    AUTH_HEADER: ${{ env.AUTH_TOKEN }}
-  with:
-    target: 'http://localhost:5050'
-    docker_name: 'ghcr.io/zaproxy/zaproxy:stable'
-    cmd_options: |
-      -m 10
-      -M 6
-      -a
-      -j
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install python deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f "app/requirements.txt" ]; then
+            pip install --no-cache-dir -r app/requirements.txt
+          else
+            echo "app/requirements.txt not found. Exiting."
+            exit 1
+          fi
+          pip install --no-cache-dir zaproxy==0.4.0
+
+      - name: Install JSON tools
+        run: sudo apt-get install -y jq
+
+      - name: Build Docker Image
+        run: |
+          echo "Dockerfile contents:"
+          cat Dockerfile
+
+          docker build -t vulnerable-app .
+
+      - name: Run Docker Container
+        run: |
+          docker run -d --name vuln-app -p 5050:5050 vulnerable-app
+
+          sleep 30
+
+          echo "Docker container logs:"
+          docker logs vuln-app
+
+          echo "Docker container status:"
+          docker ps -a
+
+          echo "Testing application accessibility:"
+          curl -I http://localhost:5050 || echo "Warning: App may not be running properly"
+
+          echo "Trying a simple GET request:"
+          curl -v http://localhost:5050/ || echo "Warning: GET request failed"
+
+      - name: Authenticate with Application
+        id: auth
+        run: |
+          echo "Attempting to authenticate with the application..."
+
+          # Authenticate and capture response
+          AUTH_RESPONSE=$(curl -s -X POST http://localhost:5050/login \
+            -H "Content-Type: application/json" \
+            -d '{"username":"admin","password":"admin123"}')
+
+          echo "Authentication response:"
+          echo $AUTH_RESPONSE | jq . 2>/dev/null || echo $AUTH_RESPONSE
+
+          # Extract auth token from response
+          # Adjust the jq filter based on your API response structure
+          AUTH_TOKEN=$(echo $AUTH_RESPONSE | jq -r '.Authorization // .token // .access_token // empty' 2>/dev/null)
+
+          if [ -z "$AUTH_TOKEN" ]; then
+            echo "Warning: Could not extract auth token from response"
+            echo "Response was: $AUTH_RESPONSE"
+            AUTH_TOKEN="Bearer "
+          else
+            echo "Authentication successful!"
+            echo "Token extracted (first 20 chars): ${AUTH_TOKEN:0:20}..."
+          fi
+
+          # Export token for use in next steps
+          echo "AUTH_TOKEN=$AUTH_TOKEN" >> $GITHUB_ENV
+          echo "auth_token=$AUTH_TOKEN" >> $GITHUB_OUTPUT
+
+          # Also save to file for potential direct ZAP access
+          echo "$AUTH_TOKEN" > /tmp/auth_token.txt
+          chmod 644 /tmp/auth_token.txt
+
+      - name: Prepare ZAP Configuration with Authentication
+        run: |
+          echo "Preparing ZAP configuration files..."
+
+          mkdir -p .zap
+
+          # Create a context file with authentication details
+          cat > .zap/context.json << 'EOF'
+          {
+            "name": "VulnerableApp",
+            "description": "Vulnerable App Context with Authentication",
+            "authentication": {
+              "type": "manual",
+              "loginUrl": "http://localhost:5050/login",
+              "username": "admin",
+              "password": "admin123"
+            }
+          }
+          EOF
+
+          echo "ZAP context file created:"
+          cat .zap/context.json
+
+          # Also create a cookie jar file if needed
+          mkdir -p .zap/cookies
+          echo "Cookie directory prepared"
+
+      - name: Pre-scan API Warmup with Authentication
+        env:
+          AUTH_HEADER: ${{ env.AUTH_TOKEN }}
+        run: |
+          echo "Running API warmup calls with authentication..."
+
+          # Set up authorization header
+          if [ -z "$AUTH_HEADER" ]; then
+            AUTH_HEADER=""
+          fi
+
+          # Test authenticated endpoints
+          echo "Testing authenticated GET endpoint:"
+          curl -v -X GET http://localhost:5050/get/2 \
+            -H "Authorization: $AUTH_HEADER" \
+            -H "Content-Type: application/json" \
+            2>&1 | head -30
+
+          echo ""
+          echo "Testing authenticated POST endpoint:"
+          curl -v -X POST http://localhost:5050/fetch/customer \
+            -H "Authorization: $AUTH_HEADER" \
+            -H "Content-Type: application/json" \
+            -d '{"id": 2}' \
+            2>&1 | head -30
+
+          echo ""
+          echo "Testing search endpoint:"
+          curl -v -X POST http://localhost:5050/search \
+            -H "Authorization: $AUTH_HEADER" \
+            -H "Content-Type: application/json" \
+            -d '{"search": "dleon"}' \
+            2>&1 | head -30
+
+          echo "API warmup complete"
+
+      - name: ZAP Scan with Authentication
+        uses: zaproxy/action-full-scan@v0.13.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          docker_name: 'ghcr.io/zaproxy/zaproxy:stable'
+          target: 'http://localhost:5050'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: |
+            -m 10
+            -M 6
+            -a
+            -j
+            -T 300
+
+      - name: Check ZAP Report
+        if: always()
+        run: |
+          echo "Checking for ZAP report..."
+
+          # The action typically generates report_html.html or report_md.md
+          if [ -f "report_html.html" ]; then
+            echo "Found HTML report"
+            ls -lah report_html.html
+          fi
+
+          if [ -f "report_md.md" ]; then
+            echo "Found Markdown report"
+            ls -lah report_md.md
+          fi
+
+          # List all generated files
+          echo "All generated files:"
+          find . -maxdepth 1 -type f -newer /tmp/auth_token.txt 2>/dev/null | head -20
+
+      - name: Upload ZAP Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-scan-report
+          path: |
+            report_html.html
+            report_md.md
+          if-no-files-found: warn
+
+      - name: Display Authentication Status
+        if: always()
+        run: |
+          echo "=== Authentication Summary ==="
+          echo "Auth Token Status: ${{ steps.auth.outcome }}"
+          if [ -f "/tmp/auth_token.txt" ]; then
+            echo "Auth token file exists"
+            echo "Token length: $(wc -c < /tmp/auth_token.txt) bytes"
+          else
+            echo "No auth token file found"
+          fi
+          echo "================================"
